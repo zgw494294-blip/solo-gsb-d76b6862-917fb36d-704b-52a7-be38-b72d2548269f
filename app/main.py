@@ -708,21 +708,31 @@ def withdraw(body: WithdrawIn, x_control_token: Optional[str] = Header(default=N
             # 无已发提示，或页面指定的提示已不是最后一条（如已被先撤回）
             return conflict(conn, x_control_token)
 
-        # 现有待发整体后挪，撤回提示以发出快照插到队首（内容取发出快照，
-        # id 与编号保留；发出快照 / 时间 / 序号清空）。
-        base = conn.execute(
-            "SELECT COALESCE(MAX(position), 0) AS m FROM cues"
-        ).fetchone()["m"]
-        conn.execute(
-            "UPDATE cues SET position = position + ? WHERE status = 'pending'",
-            (base + 1,),
-        )
+        # 撤回提示以发出快照插到现有待发队首（id 与编号保留；发出快照 /
+        # 时间 / 序号清空），随后对**全部待发**按"撤回提示 + 原待发顺序"
+        # 重新分配紧凑位置 1..n（每场最多 12 条）。不能用 MAX(position) 做
+        # 基数平移：反复确认/撤回会让位置指数增长，既有库可能已逼近 SQLite
+        # 整数上限（2^63-1），平移会溢出成浮点（同值位置退回按 id 排序，
+        # 待发相对顺序被破坏）甚至直接 OverflowError。已发提示的位置不参与
+        # 待发排序，与 1..n 重叠也没有影响。
+        existing_pending_ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM cues WHERE status = 'pending' "
+                "ORDER BY position ASC, id ASC"
+            ).fetchall()
+        ]
+        ordered_ids = [last["id"]] + existing_pending_ids
         conn.execute(
             "UPDATE cues SET status = 'pending', content = issued_content, "
-            "position = 1, issued_content = NULL, issued_at = NULL, "
-            "issued_seq = NULL WHERE id = ?",
+            "issued_content = NULL, issued_at = NULL, issued_seq = NULL "
+            "WHERE id = ?",
             (last["id"],),
         )
+        for pos, cue_id in enumerate(ordered_ids, start=1):
+            conn.execute(
+                "UPDATE cues SET position = ? WHERE id = ?", (pos, cue_id)
+            )
         # 完成态退回一条即回到演出中；暂停标记不动。
         conn.execute(
             "UPDATE meta SET version = version + 1, status = 'live' WHERE id = 1"
@@ -811,12 +821,12 @@ def reorder(body: ReorderIn, x_control_token: Optional[str] = Header(default=Non
         if len(body.order) != len(pending_ids) or set(body.order) != pending_ids:
             return conflict(conn, x_control_token)
 
-        base = conn.execute(
-            "SELECT COALESCE(MAX(position), 0) AS m FROM cues"
-        ).fetchone()["m"]
-        for offset, cue_id in enumerate(body.order, start=1):
+        # 直接按新顺序分配紧凑位置 1..n，而不是在 MAX(position) 之上追加：
+        # 后者会让位置随重排次数无限增大，与撤回叠加后可能溢出 SQLite 整数
+        # 上限。已发提示不参与待发排序，位置重叠无影响。
+        for pos, cue_id in enumerate(body.order, start=1):
             conn.execute(
-                "UPDATE cues SET position = ? WHERE id = ?", (base + offset, cue_id)
+                "UPDATE cues SET position = ? WHERE id = ?", (pos, cue_id)
             )
         conn.execute("UPDATE meta SET version = version + 1 WHERE id = 1")
         return build_state(conn, x_control_token)
