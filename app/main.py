@@ -686,6 +686,11 @@ def withdraw(body: WithdrawIn, x_control_token: Optional[str] = Header(default=N
     与相对顺序、问题记录快照均不变。已完成态撤回后回到演出中；暂停标记
     保持不变；该提示再次确认时记新的服务端时间。
 
+    位置分配：退回时把全部待发按当前相对顺序紧凑重排（撤回提示为 1，
+    其余依次为 2..n），只重赋值、不在旧位置上累加——位置不随确认/撤回
+    次数增长，反复操作不会溢出或改变相对顺序，既有库中接近 SQLite 整数
+    上限但仍可区分的位置也能正常撤回（只读旧值，撤回后恢复紧凑）。
+
     "退回待发（位置 / 内容 / 清空发出字段）+ 状态推进 + 版本 +1"在同一事务
     内提交，写入失败则全部不变。与确认、编辑、重排、归档、暂停恢复、问题
     记录等同版本竞争最多一个成功；版本过期、目标不是最后已发提示（含已被
@@ -708,21 +713,29 @@ def withdraw(body: WithdrawIn, x_control_token: Optional[str] = Header(default=N
             # 无已发提示，或页面指定的提示已不是最后一条（如已被先撤回）
             return conflict(conn, x_control_token)
 
-        # 现有待发整体后挪，撤回提示以发出快照插到队首（内容取发出快照，
-        # id 与编号保留；发出快照 / 时间 / 序号清空）。
-        base = conn.execute(
-            "SELECT COALESCE(MAX(position), 0) AS m FROM cues"
-        ).fetchone()["m"]
-        conn.execute(
-            "UPDATE cues SET position = position + ? WHERE status = 'pending'",
-            (base + 1,),
-        )
+        # 现有待发按当前相对顺序整体后移：紧凑重排为 2..n，撤回提示以发出
+        # 快照占队首位置 1（内容取发出快照，id 与编号保留；发出快照 / 时间 /
+        # 序号清空）。位置只按当前顺序重赋值、绝不在旧值上累加，因此不随
+        # 确认/撤回次数增长：反复操作不会溢出、不会改变相对顺序；既有库中
+        # 接近 SQLite 整数上限但仍可区分的位置也只被读取、不被累加，撤回后
+        # 恢复紧凑（已丢失的历史顺序不试图恢复）。
+        pending_ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM cues WHERE status = 'pending' "
+                "ORDER BY position ASC, id ASC"
+            ).fetchall()
+        ]
         conn.execute(
             "UPDATE cues SET status = 'pending', content = issued_content, "
             "position = 1, issued_content = NULL, issued_at = NULL, "
             "issued_seq = NULL WHERE id = ?",
             (last["id"],),
         )
+        for pos, cue_id in enumerate(pending_ids, start=2):
+            conn.execute(
+                "UPDATE cues SET position = ? WHERE id = ?", (pos, cue_id)
+            )
         # 完成态退回一条即回到演出中；暂停标记不动。
         conn.execute(
             "UPDATE meta SET version = version + 1, status = 'live' WHERE id = 1"
@@ -811,12 +824,12 @@ def reorder(body: ReorderIn, x_control_token: Optional[str] = Header(default=Non
         if len(body.order) != len(pending_ids) or set(body.order) != pending_ids:
             return conflict(conn, x_control_token)
 
-        base = conn.execute(
-            "SELECT COALESCE(MAX(position), 0) AS m FROM cues"
-        ).fetchone()["m"]
-        for offset, cue_id in enumerate(body.order, start=1):
+        # 按指定顺序把全部待发紧凑重排为 1..n：只在待发集合内按新顺序
+        # 重赋值，不在旧位置上累加——位置不随重排/撤回次数增长，既有库中
+        # 接近 SQLite 整数上限的位置也不会因累加而溢出。
+        for pos, cue_id in enumerate(body.order, start=1):
             conn.execute(
-                "UPDATE cues SET position = ? WHERE id = ?", (base + offset, cue_id)
+                "UPDATE cues SET position = ? WHERE id = ?", (pos, cue_id)
             )
         conn.execute("UPDATE meta SET version = version + 1 WHERE id = 1")
         return build_state(conn, x_control_token)

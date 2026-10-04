@@ -8,6 +8,13 @@
 同事务（与确认、编辑、重排、归档同版本竞争最多一个成功）；重启后结果
 保留；既有档案不受撤回影响；不提供批量撤回。
 
+位置分配回归（反复确认/撤回同一提示曾使待发位置指数增长：重排路径第
+61 次撤回时位置溢出为浮点、待发顺序静默错乱；不重排路径第 62 次撤回
+抛 OverflowError）：两条路径各跑 70 轮确认/撤回（每步提交最新版本，
+中途重启）断言顺序不变、位置紧凑不增长；既有库中接近 SQLite 整数上限
+且仍可区分的位置能正常撤回与重排；模拟写入失败时撤回整体回滚、数据
+与版本不变且异常不被吞掉。
+
 运行：python3 tests/withdraw.test.py
 """
 import os
@@ -376,6 +383,197 @@ def test_control_seat_protection():
         check(r.status_code == 200, "正确凭据撤回成功")
 
 
+def run_rounds(c, v, cue_id, expect, rounds):
+    """执行若干轮「撤回 -> 再确认」，每步提交上一步返回的最新版本号。
+
+    每轮撤回后断言待发顺序为 expect；返回 (最新版本号, 首个失败描述或 None)。
+    """
+    for n in rounds:
+        r = withdraw(c, v, cue_id)
+        if r.status_code != 200:
+            return v, f"第 {n} 次撤回返回 {r.status_code}"
+        s = r.json()
+        order = [p["number"] for p in s["pending"]]
+        if order != expect:
+            return v, f"第 {n} 次撤回后待发顺序变为 {order}（期望 {expect}）"
+        v = s["version"]
+        r = c.post("/api/confirm", json={"version": v})
+        if r.status_code != 200:
+            return v, f"第 {n} 次撤回后再确认返回 {r.status_code}"
+        v = r.json()["version"]
+    return v, None
+
+
+def max_position():
+    with main.db() as conn:
+        return conn.execute("SELECT MAX(position) AS m FROM cues").fetchone()["m"]
+
+
+def test_repeat_reorder_path():
+    """路径一（曾第 61 次撤回时顺序错乱）：重排后反复确认/撤回 70 轮。"""
+    main.DB_PATH = os.path.join(_tmp, "repeat-reorder.db")
+    with TestClient(main.app) as c:
+        print("W9 反复确认/撤回（重排路径）：70 轮顺序不变、位置不增长、重启保留")
+        s = setup_show(c)
+        v = s["version"]
+        id1, id2, id3 = [p["id"] for p in s["pending"]]
+        s = confirm(c, v)
+        v = s["version"]
+        r = c.post("/api/reorder", json={"version": v, "order": [id3, id2]})
+        check(r.status_code == 200, "重排待发为 A3、A2")
+        v = r.json()["version"]
+        v, err = run_rounds(c, v, id1, ["A1", "A3", "A2"], range(1, 36))
+        check(err is None, "重启前第 1～35 次撤回：待发始终保持 A1、A3、A2"
+              + (f"（{err}）" if err else ""))
+
+    # 重启：重新建应用连接同一数据库，结果保留后继续跑
+    with TestClient(main.app) as c:
+        s = c.get("/api/state").json()
+        check(s["version"] == v, "重启后版本号保留")
+        check([x["number"] for x in s["issued"]] == ["A1"], "重启后已发记录保留")
+        check([p["number"] for p in s["pending"]] == ["A3", "A2"],
+              "重启后待发顺序（A3、A2）保留")
+        v, err = run_rounds(c, s["version"], id1, ["A1", "A3", "A2"], range(36, 71))
+        check(err is None, "重启后第 36～70 次撤回：待发始终保持 A1、A3、A2"
+              + (f"（{err}）" if err else ""))
+        check(max_position() <= 3, "70 轮后位置仍紧凑（不随操作次数增长）")
+
+
+def test_repeat_plain_path():
+    """路径二（曾第 62 次撤回抛 OverflowError）：不重排反复确认/撤回 70 轮。"""
+    main.DB_PATH = os.path.join(_tmp, "repeat-plain.db")
+    with TestClient(main.app) as c:
+        print("W10 反复确认/撤回（不重排路径）：70 轮顺序不变、位置不增长、重启保留")
+        s = setup_show(c)
+        v = s["version"]
+        id1 = s["pending"][0]["id"]
+        s = confirm(c, v)
+        v = s["version"]
+        v, err = run_rounds(c, v, id1, ["A1", "A2", "A3"], range(1, 41))
+        check(err is None, "重启前第 1～40 次撤回：待发始终保持 A1、A2、A3"
+              + (f"（{err}）" if err else ""))
+
+    # 重启：重新建应用连接同一数据库，结果保留后继续跑
+    with TestClient(main.app) as c:
+        s = c.get("/api/state").json()
+        check(s["version"] == v, "重启后版本号保留")
+        check([p["number"] for p in s["pending"]] == ["A2", "A3"],
+              "重启后待发顺序（A2、A3）保留")
+        v, err = run_rounds(c, s["version"], id1, ["A1", "A2", "A3"], range(41, 71))
+        check(err is None, "重启后第 41～70 次撤回：待发始终保持 A1、A2、A3"
+              + (f"（{err}）" if err else ""))
+        check(max_position() <= 3, "70 轮后位置仍紧凑（不随操作次数增长）")
+
+
+def test_large_positions():
+    """既有库位置接近 SQLite 整数上限但仍可区分：撤回与重排都正常。"""
+    main.DB_PATH = os.path.join(_tmp, "large-positions.db")
+    int64_max = 9223372036854775807
+    with TestClient(main.app) as c:
+        print("W11 大位置既有库：接近整数上限且可区分的位置正常撤回/重排")
+        s = setup_show(c)
+        v = s["version"]
+        id1, id2, id3 = [p["id"] for p in s["pending"]]
+        s = confirm(c, v)
+        v = s["version"]
+        # 模拟旧缺陷留下的既有库：待发位置已接近上限（A3 在 A2 前，仍可区分）
+        with main.db() as conn:
+            conn.execute("UPDATE cues SET position = ? WHERE id = ?",
+                         (int64_max - 1, id3))
+            conn.execute("UPDATE cues SET position = ? WHERE id = ?",
+                         (int64_max, id2))
+        check([p["number"] for p in c.get("/api/state").json()["pending"]]
+              == ["A3", "A2"], "大位置下待发顺序仍按位置可区分")
+
+        r = withdraw(c, v, id1)
+        check(r.status_code == 200, "大位置库撤回成功（不抛 OverflowError）")
+        s = r.json()
+        v = s["version"]
+        check([p["number"] for p in s["pending"]] == ["A1", "A3", "A2"],
+              "大位置撤回后相对顺序保持（A1 队首，A3 仍在 A2 前）")
+        check(max_position() <= 3, "撤回后位置恢复紧凑")
+
+        # 大位置上的重排同样不再累加溢出
+        with main.db() as conn:
+            conn.execute("UPDATE cues SET position = ? WHERE id = ?",
+                         (int64_max - 1, id3))
+            conn.execute("UPDATE cues SET position = ? WHERE id = ?",
+                         (int64_max, id2))
+        r = c.post("/api/reorder", json={"version": v, "order": [id1, id2, id3]})
+        check(r.status_code == 200, "大位置库重排成功（不抛 OverflowError）")
+        s = r.json()
+        check([p["number"] for p in s["pending"]] == ["A1", "A2", "A3"],
+              "大位置重排按指定顺序生效")
+        check(max_position() <= 3, "重排后位置恢复紧凑")
+
+
+def test_withdraw_failure_rollback():
+    """撤回写入失败：退回待发 + 版本 +1 整体回滚，数据不变，异常不被吞。"""
+    main.DB_PATH = os.path.join(_tmp, "withdraw-rollback.db")
+    with TestClient(main.app, raise_server_exceptions=False) as c:
+        print("W12 失败回滚：写入失败时撤回与版本 +1 都不生效")
+        s = setup_show(c)
+        v = s["version"]
+        id1, id2, id3 = [p["id"] for p in s["pending"]]
+        s = confirm(c, v)
+        v = s["version"]
+        with main.db() as conn:
+            rows_before = {
+                r["id"]: (r["position"], r["status"], r["issued_content"],
+                          r["issued_at"], r["issued_seq"])
+                for r in conn.execute(
+                    "SELECT id, position, status, issued_content, issued_at, "
+                    "issued_seq FROM cues"
+                )
+            }
+
+        # 只在撤回的「版本 +1」语句上模拟写入失败（其前提示行已更新）
+        real_connect = main._connect
+
+        class FlakyConn:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, parameters=()):
+                if sql == ("UPDATE meta SET version = version + 1, "
+                           "status = 'live' WHERE id = 1"):
+                    raise RuntimeError("模拟写入失败")
+                return self._real.execute(sql, parameters)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        main._connect = lambda: FlakyConn(real_connect())
+        try:
+            r = withdraw(c, v, id1)
+            check(r.status_code == 500, "写入失败时撤回请求失败（异常不被吞掉）")
+        finally:
+            main._connect = real_connect
+
+        s = c.get("/api/state").json()
+        check(s["version"] == v, "失败回滚：版本号不变")
+        check([x["id"] for x in s["issued"]] == [id1], "失败回滚：已发记录不变")
+        check([p["id"] for p in s["pending"]] == [id2, id3],
+              "失败回滚：待发内容与顺序不变")
+        with main.db() as conn:
+            rows_after = {
+                r["id"]: (r["position"], r["status"], r["issued_content"],
+                          r["issued_at"], r["issued_seq"])
+                for r in conn.execute(
+                    "SELECT id, position, status, issued_content, issued_at, "
+                    "issued_seq FROM cues"
+                )
+            }
+        check(rows_after == rows_before,
+              "失败回滚：位置、状态与发出字段（快照/时间/序号）全部不变")
+
+        r = withdraw(c, v, id1)
+        check(r.status_code == 200, "失败后系统未卡死，正常撤回仍可用")
+        s = r.json()
+        check([p["id"] for p in s["pending"]] == [id1, id2, id3],
+              "失败后的正常撤回：末条退回待发队首")
+
+
 test_basic_withdraw()
 test_other_records_unchanged()
 test_done_back_to_live()
@@ -384,6 +582,10 @@ test_conflicts()
 test_same_version_competition()
 test_persistence_and_archives()
 test_control_seat_protection()
+test_repeat_reorder_path()
+test_repeat_plain_path()
+test_large_positions()
+test_withdraw_failure_rollback()
 
 print("\n全部通过" if failures == 0 else f"\n失败 {failures} 处断言")
 sys.exit(0 if failures == 0 else 1)
